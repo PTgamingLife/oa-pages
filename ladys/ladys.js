@@ -1,0 +1,351 @@
+// LadyS LIFF 前端:行事曆 / 列表 / 記帳 / 目標 / 待辦 / 生活 / 設定(生活紀錄相關函式在 ladys-life.js)
+// 本機預覽:http://localhost:<port>/ladys/?mock=1(只在 localhost 生效,用假資料)
+const LADYS_LIFF_ID = "2012319360-V7Vis4HM";
+const LADYS_API_URL = "https://hhcubvixldieuwdeqnwc.supabase.co/functions/v1/ladys-api";
+const LADYS_MOCK = ["localhost", "127.0.0.1"].includes(location.hostname) && new URLSearchParams(location.search).has("mock");
+const LADYS_OWNER = { husband: "👨 老公", wife: "👩 老婆", both: "👫 一起" };
+const LADYS_CATS = ["餐飲", "交通", "日用品", "居家", "育兒", "醫療", "娛樂", "服飾", "禮金", "其他"];
+const LADYS_PERSONAS = { butler: "溫柔管家", secretary: "簡潔秘書", buddy: "幽默朋友", custom: "自訂" };
+const WEEK = ["日", "一", "二", "三", "四", "五", "六"];
+
+const ladysS = { data: null, view: "calendar", month: "", sel: "", filter: "all", moneyMonth: "", moneyYear: 0, moneyTab: "mout", idToken: "" };
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const fmt$ = (n) => "$" + Number(n).toLocaleString("en-US");
+
+// ---------- 台北時間 ----------
+const ymdOf = (iso) => new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Taipei", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(iso));
+const hmOf = (iso) => new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Taipei", hour: "2-digit", minute: "2-digit" }).format(new Date(iso));
+const wdOf = (ymd) => new Date(ymd + "T12:00:00+08:00").getUTCDay();
+const dayLabel = (ymd) => `${+ymd.slice(5, 7)}/${+ymd.slice(8, 10)}(${WEEK[wdOf(ymd)]})`;
+function addMonths(ym, n) { const [y, m] = ym.split("-").map(Number); const d = new Date(Date.UTC(y, m - 1 + n, 1)); return d.toISOString().slice(0, 7); }
+
+// ---------- API ----------
+async function ladysApi(action, extra = {}) {
+  if (LADYS_MOCK) return ladysMockApi(action, extra);
+  const res = await fetch(LADYS_API_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ idToken: ladysS.idToken, action, ...extra }) });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(j.error || "SERVER");
+  return j;
+}
+
+function toast(msg) { const t = $("ladysToast"); t.textContent = msg; t.style.display = "block"; clearTimeout(toast.t); toast.t = setTimeout(() => (t.style.display = "none"), 1800); }
+
+async function reload() { ladysS.data = await ladysApi("load"); render(); }
+
+// ---------- 啟動 ----------
+function viewFromUrl() {
+  const q = new URLSearchParams(location.search);
+  let v = q.get("view");
+  if (!v && q.get("liff.state")) v = new URLSearchParams(q.get("liff.state").replace(/^[^?]*\?/, "")).get("view");
+  return v;
+}
+
+async function ladysBoot() {
+  const v = viewFromUrl();
+  if (v === "settings") ladysS.view = "settings";
+  else if (["calendar", "list", "money", "goals", "todos", "life", "shoot"].includes(v)) ladysS.view = v;
+  try {
+    if (!LADYS_MOCK) {
+      await new Promise((ok, ng) => { const s = document.createElement("script"); s.src = "https://static.line-scdn.net/liff/edge/2/sdk.js"; s.onload = ok; s.onerror = ng; document.head.appendChild(s); });
+      await window.liff.init({ liffId: LADYS_LIFF_ID });
+      if (!window.liff.isLoggedIn()) { window.liff.login({ redirectUri: location.href }); return; }
+      ladysS.idToken = window.liff.getIDToken();
+    }
+    await reload();
+  } catch (e) {
+    const m = String(e.message || e);
+    $("ladysMain").innerHTML = `<div class="ladys-center">${m === "NOT_MEMBER" ? "這個頁面只開放給綁定群組的兩位成員 🙏<br>請先在 LadyS 群組說一句話完成登記。" : "載入失敗,請關閉後重新開啟。<br><small>" + esc(m) + "</small>"}</div>`;
+  }
+}
+
+// ---------- 畫面 ----------
+function render() {
+  const d = ladysS.data; if (!d) return;
+  if (!ladysS.month) { ladysS.month = d.today.slice(0, 7); ladysS.sel = d.today; ladysS.moneyMonth = d.today.slice(0, 7); ladysS.moneyYear = Number(d.today.slice(0, 4)); }
+  document.querySelectorAll("#ladysNav button").forEach((b) => b.classList.toggle("on", b.dataset.view === ladysS.view));
+  $("ladysFab").style.display = ladysS.view === "settings" ? "none" : "block";
+  const titles = { calendar: "行事曆", list: "行程列表", money: "記帳", goals: "目標", todos: "待辦", life: "生活紀錄", shoot: "拍片", settings: "設定" };
+  $("ladysTitle").innerHTML = `${titles[ladysS.view]}<small>LadyS 生活秘書</small>`;
+  const fn = { calendar: viewCalendar, list: viewList, money: viewMoney, goals: () => viewNotes("goal"), todos: () => viewNotes("todo"), life: viewLife, shoot: viewShoot, settings: viewSettings }[ladysS.view];
+  $("ladysMain").innerHTML = fn();
+}
+
+const filtered = (from, toExcl) => eventsIn(from, toExcl).filter((e) => ladysS.filter === "all" || e.ladys_owner === ladysS.filter || (ladysS.filter !== "both" && e.ladys_owner === "both"));
+
+function filterChips() {
+  const opts = [["all", "全部"], ["husband", "👨 老公"], ["wife", "👩 老婆"], ["both", "👫 共同"]];
+  return `<div class="ladys-chips">${opts.map(([v, l]) => `<button class="ladys-chip ${ladysS.filter === v ? "on" : ""}" data-filter="${v}">${l}</button>`).join("")}</div>`;
+}
+
+function eventItem(e, showDate) {
+  const t = e.ladys_all_day ? "全天" : hmOf(e.ladys_start_at) + (e.ladys_end_at ? "–" + hmOf(e.ladys_end_at) : "");
+  return `<div class="ladys-item" data-edit="event" data-id="${e.id}"><i class="ladys-bar ladys-o-${e.ladys_owner}"></i>
+    <div class="t"><div>${esc(e.ladys_title)}${yearlyBadge(e)}</div><div class="s">${showDate ? dayLabel(ymdOf(e.ladys_start_at)) + " · " : ""}${t}${e.ladys_location ? " · 📍" + esc(e.ladys_location) : ""}</div>${e.ladys_note ? `<div class="s ladys-note">📝 ${esc(e.ladys_note.length > 30 ? e.ladys_note.slice(0, 30) + "…" : e.ladys_note)}</div>` : ""}</div>
+    <div class="s">${LADYS_OWNER[e.ladys_owner].slice(0, 2)}</div></div>`;
+}
+
+function viewCalendar() {
+  const ym = ladysS.month, [y, m] = ym.split("-").map(Number);
+  const first = wdOf(`${ym}-01`), days = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  const byDay = {}, period = periodDaySet(), lifeBy = {};
+  for (const e of filtered(`${ym}-01`, `${addMonths(ym, 1)}-01`)) (byDay[ymdOf(e.ladys_start_at)] ||= []).push(e);
+  for (const r of ladysS.data.life || []) (lifeBy[r.ladys_date] ||= []).push(r);
+  let cells = WEEK.map((w) => `<div class="wd">${w}</div>`).join("");
+  for (let i = 0; i < first; i++) cells += "<div></div>";
+  for (let dd = 1; dd <= days; dd++) {
+    const k = `${ym}-${String(dd).padStart(2, "0")}`, list = byDay[k] || [];
+    const owners = [...new Set(list.map((e) => e.ladys_owner))];
+    cells += `<button class="ladys-day ${k === ladysS.data.today ? "today" : ""} ${k === ladysS.sel ? "sel" : ""}" data-day="${k}"><b>${dd}</b>
+      <div class="ladys-dots">${owners.map((o) => `<i class="ladys-o-${o}"></i>`).join("")}${period.has(k) ? '<i class="ladys-period"></i>' : ""}</div></button>`;
+  }
+  const sel = byDay[ladysS.sel] || [], selLife = lifeBy[ladysS.sel] || [];
+  return `${filterChips()}<div class="ladys-card"><div class="ladys-cal-head"><button data-month="-1">‹</button><b>${y} 年 ${m} 月</b><button data-month="1">›</button></div>
+    <div class="ladys-grid">${cells}</div></div>
+    <div class="ladys-sec">${dayLabel(ladysS.sel)}${ladysS.sel === ladysS.data.today ? " 今天" : ""}</div>
+    <div class="ladys-card">${sel.length ? sel.map((e) => eventItem(e, false)).join("") : '<div class="ladys-empty">這天沒有安排 🌿</div>'}</div>
+    ${selLife.length ? `<div class="ladys-card">${selLife.map(lifeItem).join("")}</div>` : ""}`;
+}
+
+function viewList() {
+  const today = ladysS.data.today, groups = {};
+  for (const e of filtered(today, addDaysYmd(today, 366))) { const k = ymdOf(e.ladys_start_at); if (k >= today) (groups[k] ||= []).push(e); }
+  const keys = Object.keys(groups).sort();
+  return filterChips() + (keys.length ? keys.map((k) => `<div class="ladys-sec">${dayLabel(k)}${k === today ? " 今天" : ""}</div><div class="ladys-card">${groups[k].map((e) => eventItem(e, false)).join("")}</div>`).join("")
+    : '<div class="ladys-card"><div class="ladys-empty">接下來沒有安排 🌿</div></div>');
+}
+
+
+function viewNotes(kind) {
+  const rows = ladysS.data.notes.filter((n) => (kind === "goal" ? n.ladys_kind === "goal" : n.ladys_kind !== "goal"));
+  const open = rows.filter((n) => !n.ladys_done), done = rows.filter((n) => n.ladys_done);
+  const item = (n) => `<div class="ladys-item ${n.ladys_done ? "ladys-done" : ""}" data-edit="note" data-id="${n.id}">
+    <button class="ladys-check ${n.ladys_done ? "on" : ""}" data-toggle="${n.id}" aria-label="完成">${n.ladys_done ? "✓" : ""}</button>
+    <div class="t"><div>${kind === "goal" ? "🎯 " : ""}${esc(n.ladys_content)}</div><div class="s">${LADYS_OWNER[n.ladys_owner] || ""}</div></div></div>`;
+  return `<div class="ladys-card">${open.length ? open.map(item).join("") : `<div class="ladys-empty">${kind === "goal" ? "還沒有目標 🌱" : "全部完成了 ✨"}</div>`}</div>
+    ${done.length ? `<div class="ladys-sec">已完成 ${done.length}</div><div class="ladys-card">${done.map(item).join("")}</div>` : ""}`;
+}
+
+function viewSettings() {
+  const s = ladysS.data.settings;
+  const sw = (k, label) => `<label class="ladys-switch"><span>${label}</span><input type="checkbox" data-set="${k}" ${s["ladys_" + k] ? "checked" : ""}></label>`;
+  return `<div class="ladys-sec">說話方式</div><div class="ladys-card">
+    <div class="ladys-seg" id="ladysPersona">${Object.entries(LADYS_PERSONAS).map(([v, l]) => `<button data-persona="${v}" class="${s.ladys_persona === v ? "on" : ""}">${l}</button>`).join("")}</div>
+    <div class="ladys-field" style="margin-top:10px;${s.ladys_persona === "custom" ? "" : "display:none"}" id="ladysCustomBox"><label>自訂角色描述</label>
+    <textarea id="ladysCustom" rows="3" maxlength="200" placeholder="例如:像貼心的姊姊,講話溫柔但會提醒我們存錢">${esc(s.ladys_persona_custom)}</textarea></div></div>
+    <div class="ladys-sec">推播時間</div><div class="ladys-card"><div class="ladys-row2">
+    <div class="ladys-field"><label>早上推播行程</label><input type="time" id="ladysMorning" value="${s.ladys_morning_time}"></div>
+    <div class="ladys-field"><label>晚上整理對話</label><input type="time" id="ladysNightly" value="${s.ladys_nightly_time}"></div></div>
+    <div class="ladys-field"><label>傍晚運動提醒(推兩招雙人運動動畫)</label><input type="time" id="ladysWorkoutTime" value="${s.ladys_workout_time || "18:00"}"></div>
+    ${sw("workout_enabled", "🏃 每天推運動提醒")}
+    ${sw("push_empty", "今天沒行程也推「今天沒有安排」")}</div>
+    <div class="ladys-sec">晚上要整理哪些</div><div class="ladys-card">${sw("extract_events", "📅 行事曆")}${sw("extract_expenses", "💰 收入與支出")}${sw("extract_notes", "🎯 目標與 ☑️ 待辦")}</div>
+    <div class="ladys-sec">Google 日曆同步</div><div class="ladys-card">
+    ${ladysS.data.gcalReady ? "" : '<div class="s" style="color:var(--ladys-danger);font-size:12px;margin-bottom:6px">尚未設定 Google 授權,開啟也不會同步</div>'}
+    ${sw("gcal_enabled", "把行事曆同步到 Google")}
+    <div class="ladys-field" style="margin-top:10px"><label>日曆 ID(Google 日曆 → 設定 → 整合日曆)</label>
+    <input id="ladysGcalId" placeholder="xxxx@group.calendar.google.com" value="${esc(s.ladys_gcal_calendar_id)}"></div>
+    <div class="s" style="color:var(--ladys-muted);font-size:12px">單向同步:在 LadyS 新增/修改/刪除會更新到 Google;在 Google 上改的不會回來。</div></div>
+    ${shootSettingsHtml(s, sw)}
+    ${lifeSettingsHtml(s)}
+    <div class="ladys-sec">💼 工作群(只記錄、不說話)</div><div class="ladys-card">
+    ${(ladysS.data.workGroups || []).map((g) => `<div class="ladys-switch"><span>${esc(g.name)}</span><button class="ladys-btn danger" style="flex:0 0 auto;padding:6px 12px" data-unbind="${esc(g.id)}">解除</button></div>`).join("")
+      || '<div class="s" style="color:var(--ladys-muted);font-size:12px">還沒有工作群</div>'}
+    <div class="s" style="color:var(--ladys-muted);font-size:12px;margin-top:8px">把 LadyS 拉進工作群後,由你在群裡輸入「LadyS 紀錄 綁定碼」。LadyS 在工作群不會回話,每晚把重點整理成確認卡發到家庭群組,按 ✅ 才會加入。</div></div>
+    <div class="ladys-sec">成員</div><div class="ladys-card">${ladysS.data.members.map((m) => `<div class="ladys-row2 ladys-mrow">
+      <input data-mname="${m.ladys_line_uid}" value="${esc(m.ladys_name)}" maxlength="20">
+      <select data-mrole="${m.ladys_line_uid}"><option value="husband" ${m.ladys_role === "husband" ? "selected" : ""}>👨 老公</option><option value="wife" ${m.ladys_role === "wife" ? "selected" : ""}>👩 老婆</option></select></div>`).join("")}
+      ${ladysS.data.members.length < 2 ? '<div class="s" style="color:var(--ladys-muted);font-size:12px">另一位在群組說一句話後會自動加入</div>' : ""}</div>
+    <div class="ladys-actions"><button class="ladys-btn" id="ladysSaveSettings">儲存設定</button></div>`;
+}
+
+// ---------- 編輯面板 ----------
+function seg(name, opts, val) {
+  return `<div class="ladys-seg" data-seg="${name}">${opts.map(([v, l]) => `<button type="button" data-v="${v}" class="${v === val ? "on" : ""}">${l}</button>`).join("")}</div>`;
+}
+const OWNER_OPTS = [["husband", "👨 老公"], ["wife", "👩 老婆"], ["both", "👫 一起"]];
+
+function openSheet(kind, row) {
+  const d = ladysS.data, isNew = !row;
+  let html = "";
+  if (kind === "event") {
+    const date = row ? ymdOf(row.ladys_start_at) : (ladysS.view === "calendar" ? ladysS.sel : d.today);
+    html = `<h3>${isNew ? "新增行程" : "編輯行程"}</h3>
+      <div class="ladys-field"><label>內容</label><input id="fTitle" maxlength="80" value="${esc(row?.ladys_title)}"></div>
+      <div class="ladys-field"><label>日期</label><input type="date" id="fDate" value="${date}"></div>
+      <div class="ladys-row2"><div class="ladys-field"><label>開始(空白=全天)</label><input type="time" id="fTime" value="${row && !row.ladys_all_day ? hmOf(row.ladys_start_at) : ""}"></div>
+      <div class="ladys-field"><label>結束</label><input type="time" id="fEnd" value="${row?.ladys_end_at ? hmOf(row.ladys_end_at) : ""}"></div></div>
+      <div class="ladys-field"><label>地點</label><input id="fLoc" maxlength="60" value="${esc(row?.ladys_location)}"></div>
+      <div class="ladys-field"><label>備註</label><textarea id="fNote" rows="3" maxlength="300" placeholder="要帶的東西、聯絡人、訂位細節…">${esc(row?.ladys_note)}</textarea></div>
+      <div class="ladys-field"><label>是誰的</label>${seg("owner", OWNER_OPTS, row?.ladys_owner || "both")}</div>
+      <label class="ladys-switch"><span>💝 每年重複(生日、紀念日)</span><input type="checkbox" id="fYearly" ${row?.ladys_recur === "yearly" ? "checked" : ""}></label>`;
+  } else if (kind === "life") {
+    html = lifeSheet(row, isNew, ladysS.view === "calendar" ? ladysS.sel : d.today);
+  } else if (kind === "shoot") {
+    html = shootSheet(row, isNew);
+  } else if (kind === "receivable") {
+    html = receivableSheet(row, isNew);
+  } else if (kind === "expense") {
+    html = expenseSheet(row, isNew, d.today);
+  } else {
+    const k = row?.ladys_kind === "goal" || (!row && ladysS.view === "goals") ? "goal" : "todo";
+    html = `<h3>${isNew ? "新增" : "編輯"}</h3>
+      <div class="ladys-field"><label>類型</label>${seg("kind", [["goal", "🎯 目標"], ["todo", "☑️ 待辦"]], k)}</div>
+      <div class="ladys-field"><label>內容</label><textarea id="fContent" rows="3" maxlength="120">${esc(row?.ladys_content)}</textarea></div>
+      <div class="ladys-field"><label>是誰的</label>${seg("owner", OWNER_OPTS, row?.ladys_owner || "both")}</div>`;
+  }
+  html += `<div class="ladys-actions">${isNew ? "" : '<button class="ladys-btn danger" id="fDel">刪除</button>'}<button class="ladys-btn ghost" id="fCancel">取消</button><button class="ladys-btn" id="fSave">儲存</button></div>`;
+  const sh = $("ladysSheet"); sh.innerHTML = html; sh.dataset.kind = kind; sh.dataset.id = row?.id || "";
+  $("ladysSheetBg").style.display = "block"; requestAnimationFrame(() => sh.classList.add("open"));
+}
+function closeSheet() { $("ladysSheet").classList.remove("open"); $("ladysSheetBg").style.display = "none"; }
+const segVal = (name) => $("ladysSheet").querySelector(`[data-seg="${name}"] .on`)?.dataset.v;
+
+async function saveSheet() {
+  const sh = $("ladysSheet"), kind = sh.dataset.kind, id = sh.dataset.id || undefined, v = (x) => $(x)?.value ?? "";
+  let data;
+  if (kind === "event") data = { id, title: v("fTitle"), date: v("fDate"), time: v("fTime"), end_time: v("fEnd"), location: v("fLoc"), note: v("fNote"), owner: segVal("owner"), yearly: $("fYearly").checked };
+  else if (kind === "life") data = { id, date: v("fDate"), kind: segVal("lkind"), content: v("fContent"), owner: segVal("owner") };
+  else if (kind === "shoot") data = { id, topic: v("fTopic"), date: v("fDate"), time: v("fTime"), owner: segVal("owner"), content: v("fContent"), prep: v("fPrep"), status: v("fStatus"), next_step: v("fNext") };
+  else if (kind === "receivable") data = { id, party: v("fParty"), amount: v("fAmount"), owner: segVal("owner") };
+  else if (kind === "expense") data = { id, amount: v("fAmount"), date: v("fDate"), category: v("fCat"), note: v("fNote"), payer: segVal("owner"), flow: v("fFlow") };
+  else { const old = ladysS.data.notes.find((n) => n.id === id); data = { id, content: v("fContent"), kind: segVal("kind"), owner: segVal("owner"), done: old?.ladys_done === true }; }
+  if (kind === "event" && !data.title.trim()) return toast("請填內容");
+  if (kind === "expense" && !(Number(data.amount) > 0)) return toast("請填金額");
+  if (kind === "shoot" && !data.topic.trim()) return toast("請填主題");
+  if (kind === "receivable" && !data.party.trim()) return toast("請填對象");
+  if (kind === "receivable" && !(Number(data.amount) > 0)) return toast("請填金額");
+  if (kind === "note" && !data.content.trim()) return toast("請填內容");
+  if (kind === "life" && !data.content.trim() && !data.kind.startsWith("period")) return toast("請填內容");
+  try { await ladysApi("save", { kind, data }); closeSheet(); await reload(); toast("已儲存"); } catch (e) { toast("儲存失敗:" + e.message); }
+}
+
+// ---------- 事件 ----------
+document.addEventListener("click", async (ev) => {
+  const t = ev.target.closest("button, [data-edit]"); if (!t) return;
+  const d = ladysS.data;
+  if (t.closest("#ladysNav")) { ladysS.view = t.dataset.view; render(); window.scrollTo(0, 0); return; }
+  if (t.id === "ladysGear") { ladysS.view = "settings"; render(); return; }
+  if (t.id === "ladysFab") return openSheet(ladysS.view === "money" && ladysS.moneyTab === "recv" ? "receivable" : { calendar: "event", list: "event", money: "expense", life: "life", shoot: "shoot" }[ladysS.view] || "note");
+  if (t.dataset.filter) { ladysS.filter = t.dataset.filter; render(); return; }
+  if (t.dataset.month) { ladysS.month = addMonths(ladysS.month, +t.dataset.month); render(); return; }
+  if (t.dataset.mtab) { ladysS.moneyTab = t.dataset.mtab; render(); return; }
+  if (t.dataset.myear) { ladysS.moneyYear += +t.dataset.myear; render(); return; }
+  if (t.dataset.mmonth) { ladysS.moneyMonth = addMonths(ladysS.moneyMonth, +t.dataset.mmonth); render(); return; }
+  if (t.dataset.day) { ladysS.sel = t.dataset.day; render(); return; }
+  if (t.dataset.toggle) {
+    ev.stopPropagation();
+    const n = d.notes.find((x) => x.id === t.dataset.toggle);
+    try { await ladysApi("save", { kind: "note", data: { id: n.id, content: n.ladys_content, kind: n.ladys_kind, owner: n.ladys_owner, done: !n.ladys_done } }); await reload(); } catch (e) { toast("更新失敗"); }
+    return;
+  }
+  if (t.dataset.recv) {
+    ev.stopPropagation();
+    const x = d.receivables.find((r) => r.id === t.dataset.recv);
+    if (!confirm(`${x.ladys_party} 已經還 ${fmt$(x.ladys_amount)} 了嗎?\n會自動記成一筆收入`)) return;
+    try { await ladysApi("receive", { id: x.id }); await reload(); toast("已收款,已記入收入"); } catch (e) { toast("操作失敗:" + e.message); }
+    return;
+  }
+  if (t.dataset.edit) {
+    const list = { event: [...d.events, ...d.yearly], expense: d.expenses, receivable: d.receivables, shoot: d.shoots, note: d.notes, life: d.life }[t.dataset.edit];
+    return openSheet(t.dataset.edit, list.find((x) => x.id === t.dataset.id));
+  }
+  if (t.closest("[data-seg]")) { t.parentElement.querySelectorAll("button").forEach((b) => b.classList.toggle("on", b === t)); return; }
+  if (t.id === "fCancel") return closeSheet();
+  if (t.id === "fSave") return saveSheet();
+  if (t.id === "fDel") {
+    if (!confirm("確定刪除?")) return;
+    try { await ladysApi("delete", { kind: $("ladysSheet").dataset.kind, id: $("ladysSheet").dataset.id }); closeSheet(); await reload(); toast("已刪除"); } catch (e) { toast("刪除失敗"); }
+    return;
+  }
+  if (t.dataset.persona) {
+    document.querySelectorAll("[data-persona]").forEach((b) => b.classList.toggle("on", b === t));
+    $("ladysCustomBox").style.display = t.dataset.persona === "custom" ? "" : "none"; return;
+  }
+  if (t.dataset.unbind) {
+    if (!confirm("解除後 LadyS 會退出這個工作群,確定?")) return;
+    try { await ladysApi("unbindWork", { id: t.dataset.unbind }); await reload(); toast("已解除"); } catch (e) { toast("解除失敗"); }
+    return;
+  }
+  if (t.id === "ladysSaveSettings") {
+    const data = { persona: document.querySelector("[data-persona].on")?.dataset.persona, persona_custom: $("ladysCustom").value, morning_time: $("ladysMorning").value, nightly_time: $("ladysNightly").value, workout_time: $("ladysWorkoutTime").value, shoot_time: $("ladysShootTime").value, shoot_dir_husband: $("ladysShootDirH").value, shoot_dir_wife: $("ladysShootDirW").value, gcal_calendar_id: $("ladysGcalId").value.trim(),
+      anniv_remind_days: $("ladysAnnivDays").value.split(/[,，\s]+/).filter(Boolean).map(Number), period_remind_days: Number($("ladysPeriodDays").value),
+      period_remind_to: document.querySelector('[data-seg="premto"] .on')?.dataset.v };
+    document.querySelectorAll("[data-set]").forEach((c) => (data[c.dataset.set] = c.checked));
+    try {
+      await ladysApi("settings", { data });
+      for (const m of d.members) {
+        const name = document.querySelector(`[data-mname="${m.ladys_line_uid}"]`).value, role = document.querySelector(`[data-mrole="${m.ladys_line_uid}"]`).value;
+        if (name !== m.ladys_name || role !== m.ladys_role) await ladysApi("member", { data: { uid: m.ladys_line_uid, name, role } });
+      }
+      await reload(); toast(data.gcal_enabled ? "設定已儲存,已同步 Google" : "設定已儲存");
+    } catch (e) { toast("儲存失敗:" + e.message); }
+  }
+});
+$("ladysSheetBg").addEventListener("click", closeSheet);
+
+// ---------- 本機假資料(只在 localhost?mock=1)----------
+function ladysMockApi(action, extra) {
+  const db = (ladysMockApi.db ||= (() => {
+    const today = ymdOf(new Date().toISOString()), at = (n, hm) => new Date(new Date(today + "T" + (hm || "00:00") + ":00+08:00").getTime() + n * 864e5).toISOString();
+    const id = () => crypto.randomUUID();
+    return { me: "Umock", today, settings: { ladys_persona: "butler", ladys_persona_custom: "", ladys_morning_time: "07:30", ladys_nightly_time: "23:00", ladys_workout_time: "18:00", ladys_workout_enabled: true, ladys_shoot_enabled: true, ladys_shoot_time: "09:00", ladys_shoot_dir_husband: "LINE 個人 AI 秘書設定與教學", ladys_shoot_dir_wife: "銅鑼浴", ladys_push_empty: true, ladys_extract_events: true, ladys_extract_expenses: true, ladys_extract_notes: true, ladys_gcal_enabled: false, ladys_gcal_calendar_id: null, ladys_anniv_remind_days: [7, 0], ladys_period_remind_days: 2, ladys_period_remind_to: "both" }, gcalReady: false,
+      workGroups: [{ id: "C" + "c".repeat(32), name: "某某公司專案群" }],
+      yearly: [{ id: id(), ladys_title: "結婚紀念日", ladys_start_at: "2020-07-02T16:00:00.000Z", ladys_end_at: null, ladys_all_day: true, ladys_owner: "both", ladys_location: "", ladys_recur: "yearly" }],
+      life: [{ id: id(), ladys_date: addDaysYmd(today, -3), ladys_kind: "period_start", ladys_content: "經期開始", ladys_owner: "wife" },
+        { id: id(), ladys_date: addDaysYmd(today, -31), ladys_kind: "period_start", ladys_content: "經期開始", ladys_owner: "wife" },
+        { id: id(), ladys_date: addDaysYmd(today, -1), ladys_kind: "health", ladys_content: "感冒去看醫生", ladys_owner: "husband" }],
+      members: [{ ladys_line_uid: "U" + "a".repeat(32), ladys_name: "柏廷", ladys_role: "husband" }, { ladys_line_uid: "U" + "b".repeat(32), ladys_name: "老婆", ladys_role: "wife" }],
+      events: [{ id: id(), ladys_title: "跟媽媽分享:請款30、誰先找到工作誰上班", ladys_start_at: at(0), ladys_all_day: true, ladys_owner: "both", ladys_location: "", ladys_note: "帶存摺影本、記得先打電話確認" },
+        { id: id(), ladys_title: "牙醫回診", ladys_start_at: at(1, "10:30"), ladys_end_at: at(1, "11:30"), ladys_all_day: false, ladys_owner: "wife", ladys_location: "仁愛診所" },
+        { id: id(), ladys_title: "跟客戶開會", ladys_start_at: at(3, "14:00"), ladys_all_day: false, ladys_owner: "husband", ladys_location: "" }],
+      expenses: [{ id: id(), ladys_date: today, ladys_amount: 850, ladys_category: "日用品", ladys_payer: "wife", ladys_note: "全聯" }, { id: id(), ladys_date: today, ladys_amount: 320, ladys_category: "餐飲", ladys_payer: "husband", ladys_note: "午餐" },
+        { id: id(), ladys_date: today.slice(0, 8) + "05", ladys_amount: 52000, ladys_category: "薪資", ladys_payer: "husband", ladys_note: "公司薪水", ladys_flow: "in" },
+        { id: id(), ladys_date: today.slice(0, 5) + "03-10", ladys_amount: 30000, ladys_category: "獎金", ladys_payer: "wife", ladys_note: "年終", ladys_flow: "in" },
+        { id: id(), ladys_date: today.slice(0, 5) + "03-12", ladys_amount: 4200, ladys_category: "交通", ladys_payer: "both", ladys_note: "加油", ladys_flow: "out" }],
+      shoots: [{ id: id(), ladys_date: addDaysYmd(today, 2), ladys_time: "14:00", ladys_owner: "husband", ladys_topic: "3 分鐘設定 LINE AI 秘書", ladys_content: "", ladys_prep: "手機架、補光燈", ladys_status: "待拍攝", ladys_next_step: "跟剪片 agent 確認腳本" },
+        { id: id(), ladys_date: null, ladys_time: "", ladys_owner: "wife", ladys_topic: "銅鑼浴入門:第一次體驗", ladys_content: "🎬 開場 hook:你聽過會震動全身的聲音嗎?", ladys_prep: "", ladys_status: "腳本完成", ladys_next_step: "", ladys_brief: "新手受眾,CTA 私訊預約", ladys_final_url: "" }],
+      receivables: [{ id: id(), ladys_party: "小明", ladys_amount: 3000, ladys_owner: "husband", ladys_status: "open", ladys_created_at: at(-2) },
+        { id: id(), ladys_party: "阿姨", ladys_amount: 20000, ladys_owner: "both", ladys_status: "open", ladys_created_at: at(-9) },
+        { id: id(), ladys_party: "同事小華", ladys_amount: 1500, ladys_owner: "wife", ladys_status: "received", ladys_received_at: at(-1), ladys_created_at: at(-20) }],
+      notes: [{ id: id(), ladys_content: "利用半年把債務還清", ladys_kind: "goal", ladys_owner: "both", ladys_done: false },
+        { id: id(), ladys_content: "準備戶口名簿、401 報表、國泰存摺", ladys_kind: "todo", ladys_owner: "both", ladys_done: false }] };
+  })());
+  const key = { event: "events", expense: "expenses", note: "notes", life: "life", receivable: "receivables", shoot: "shoots" };
+  if (action === "load") {
+    const starts = db.life.filter((r) => r.ladys_kind === "period_start").map((r) => r.ladys_date).sort();
+    const gaps = starts.slice(1).map((d, i) => daysBetween(starts[i], d)).filter((g) => g >= 15 && g <= 60);
+    const avg = gaps.length ? Math.round(gaps.reduce((a, b) => a + b, 0) / gaps.length) : null, last = starts.at(-1) || null;
+    db.life.sort((a, b) => b.ladys_date.localeCompare(a.ladys_date));
+    return Promise.resolve(JSON.parse(JSON.stringify({ ...db, period: { last, avg, next: last && avg ? addDaysYmd(last, avg) : null, count: starts.length } })));
+  }
+  if (action === "delete" && extra.kind === "event") { db.events = db.events.filter((x) => x.id !== extra.id); db.yearly = db.yearly.filter((x) => x.id !== extra.id); return Promise.resolve({ ok: true }); }
+  if (action === "delete") { db[key[extra.kind]] = db[key[extra.kind]].filter((x) => x.id !== extra.id); return Promise.resolve({ ok: true }); }
+  if (action === "save") {
+    const b = extra.data; let row;
+    if (extra.kind === "event") { const all = !b.time; row = { ladys_title: b.title, ladys_start_at: new Date(`${b.date}T${all ? "00:00" : b.time}:00+08:00`).toISOString(), ladys_end_at: !all && b.end_time ? new Date(`${b.date}T${b.end_time}:00+08:00`).toISOString() : null, ladys_all_day: all, ladys_location: b.location, ladys_note: b.note, ladys_owner: b.owner, ladys_recur: b.yearly ? "yearly" : "none" }; }
+    else if (extra.kind === "life") row = { ladys_date: b.date, ladys_kind: b.kind, ladys_content: b.content || (b.kind === "period_start" ? "經期開始" : "經期結束"), ladys_owner: b.kind.startsWith("period") ? "wife" : b.owner };
+    else if (extra.kind === "expense") row = { ladys_date: b.date, ladys_amount: Math.round(+b.amount), ladys_category: b.category, ladys_payer: b.payer, ladys_note: b.note, ladys_flow: b.flow };
+    else if (extra.kind === "shoot") row = { ladys_date: b.date || null, ladys_time: b.time, ladys_owner: b.owner, ladys_topic: b.topic, ladys_content: b.content, ladys_prep: b.prep, ladys_status: b.date && b.status === "腳本完成" ? "待拍攝" : b.status, ladys_next_step: b.next_step };
+    else if (extra.kind === "receivable") row = { ladys_party: b.party, ladys_amount: Math.round(+b.amount), ladys_owner: b.owner, ladys_status: "open", ladys_created_at: new Date().toISOString() };
+    else row = { ladys_content: b.content, ladys_kind: b.kind, ladys_owner: b.owner, ladys_done: b.done };
+    if (extra.kind === "event") { db.events = db.events.filter((x) => x.id !== b.id || !b.yearly); db.yearly = db.yearly.filter((x) => x.id !== b.id || b.yearly); }
+    const list = extra.kind === "event" && b.yearly ? db.yearly : db[key[extra.kind]], i = list.findIndex((x) => x.id === b.id);
+    if (i >= 0) Object.assign(list[i], row); else list.push({ id: b.id || crypto.randomUUID(), ...row });
+    if (extra.kind === "event") list.sort((a, c) => a.ladys_start_at.localeCompare(c.ladys_start_at));
+    return Promise.resolve({ ok: true });
+  }
+  if (action === "receive") {
+    const r = db.receivables.find((x) => x.id === extra.id && x.ladys_status === "open"); if (!r) return Promise.reject(new Error("NOT_FOUND"));
+    r.ladys_status = "received"; r.ladys_received_at = new Date().toISOString();
+    db.expenses.unshift({ id: crypto.randomUUID(), ladys_date: db.today, ladys_amount: r.ladys_amount, ladys_category: "其他", ladys_payer: r.ladys_owner, ladys_note: "應收:" + r.ladys_party, ladys_flow: "in" });
+    return Promise.resolve({ ok: true });
+  }
+  if (action === "settings" && extra.data.gcal_calendar_id && !/^[\w.+-]+@[\w.-]+$/.test(extra.data.gcal_calendar_id)) return Promise.reject(new Error("BAD_CALENDAR_ID"));
+  if (action === "settings") { for (const [k, v] of Object.entries(extra.data)) if (v !== undefined) db.settings["ladys_" + k] = v; return Promise.resolve({ ok: true }); }
+  if (action === "unbindWork") { db.workGroups = db.workGroups.filter((g) => g.id !== extra.id); return Promise.resolve({ ok: true }); }
+  if (action === "member") { const m = db.members.find((x) => x.ladys_line_uid === extra.data.uid); m.ladys_name = extra.data.name; m.ladys_role = extra.data.role; return Promise.resolve({ ok: true }); }
+  return Promise.reject(new Error("BAD_ACTION"));
+}
+
+ladysBoot();
